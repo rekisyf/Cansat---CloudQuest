@@ -1,0 +1,153 @@
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <MPU9250.h>  // GY-91 IMU
+#include <SPI.h>
+#include <SD.h>
+#include <LoRa.h>
+
+// Sensorer
+Adafruit_BME280 bme;      // BME280 for trykk, temp, fuktighet
+MPU9250 imu;  // GY-91 (IMU: akselerometer + gyro)
+
+// SO2 og NO2 sensorer (Analoge innganger)
+#define SO2_PIN A1
+#define NO2_PIN A2
+
+// LoRa radio
+#define LORA_CS 8
+#define LORA_RST 4
+#define LORA_IRQ 3
+
+// SD-kort
+#define SD_CS 4  // Feather M0 bruker pin 4 for SD-kort
+
+// Variabler for Moving Average Filter
+const int filterSize = 10;
+float tempBuffer[filterSize] = {0};
+float pressureBuffer[filterSize] = {0};
+int filterIndex = 0;
+
+// Variabler for Kalman-filter
+float kalmanAngleX = 0, kalmanAngleY = 0;
+float biasX = 0, biasY = 0;
+float P[2][2] = {{1, 0}, {0, 1}};
+float dt = 0.01;
+
+// Funksjon: Kalman-filter for IMU-data
+float kalmanFilter(float newAngle, float newRate, float &bias, float P[2][2]) {
+    float rate = newRate - bias;
+    float angle = kalmanAngleX + dt * rate;
+
+    P[0][0] += dt * (dt * P[1][1] - P[0][1] - P[1][0] + 1);
+    P[0][1] -= dt * P[1][1];
+    P[1][0] -= dt * P[1][1];
+    P[1][1] += 0.01;
+
+    float S = P[0][0] + 0.03;
+    float K[2] = {P[0][0] / S, P[1][0] / S};
+
+    angle += K[0] * (newAngle - angle);
+    bias += K[1] * (newAngle - angle);
+
+    P[0][0] -= K[0] * P[0][0];
+    P[0][1] -= K[0] * P[0][1];
+    P[1][0] -= K[1] * P[0][0];
+    P[1][1] -= K[1] * P[0][1];
+
+    return angle;
+}
+
+// Funksjon: Moving Average Filter
+float movingAverage(float newValue, float *buffer) {
+    buffer[filterIndex] = newValue;
+    float sum = 0;
+    for (int i = 0; i < filterSize; i++) sum += buffer[i];
+    return sum / filterSize;
+}
+
+// Oppsett
+void setup() {
+    Serial.begin(115200);
+    Wire.begin();
+
+    // Initialiser BME280
+    if (!bme.begin(0x76)) {
+        Serial.println("Feil: BME280 ikke funnet!");
+    }
+
+    // Initialiser IMU uten .begin()
+    if (imu.setup(0x68) != 0) {  // Bruk .setup() i stedet
+        Serial.println("Feil: GY-91 IMU ikke funnet!");
+    } else {
+        Serial.println("IMU initialisert!");
+    }
+
+    // Start SD-kort
+    if (!SD.begin(SD_CS)) {
+        Serial.println("Advarsel: SD-kort ikke tilgjengelig!");
+    }
+
+    // Initialiser LoRa
+    LoRa.setPins(LORA_CS, LORA_RST, LORA_IRQ);
+    if (!LoRa.begin(900E6)) {
+        Serial.println("Feil: LoRa initialisering mislyktes!");
+    }
+
+    Serial.println("Systemet er klart!");
+}
+
+
+
+// Lese sensordata og filtrere
+void loop() {
+    float temperature = bme.readTemperature();
+    float pressure = bme.readPressure() / 100.0F; // hPa
+    float humidity = bme.readHumidity();
+    
+    // Kalman-filter for gyrodata
+    imu.readSensor();
+    float accX = imu.getAccelX_mss();
+    float accY = imu.getAccelY_mss();
+    float gyroX = imu.getGyroX_rads();
+    float gyroY = imu.getGyroY_rads();
+
+    kalmanAngleX = kalmanFilter(accX, gyroX, biasX, P);
+    kalmanAngleY = kalmanFilter(accY, gyroY, biasY, P);
+
+    // Moving Average Filter
+    float filteredTemp = movingAverage(temperature, tempBuffer);
+    float filteredPressure = movingAverage(pressure, pressureBuffer);
+
+    // Les SO2- og NO2-sensorene (Analog inngang, skalert til 3.3V ADC)
+    float so2_value = analogRead(SO2_PIN) * (3.3 / 1023.0);
+    float no2_value = analogRead(NO2_PIN) * (3.3 / 1023.0);
+
+    // Send data over LoRa
+    LoRa.beginPacket();
+    LoRa.print(filteredTemp);
+    LoRa.print(",");
+    LoRa.print(filteredPressure);
+    LoRa.print(",");
+    LoRa.print(humidity);
+    LoRa.print(",");
+    LoRa.print(kalmanAngleX);
+    LoRa.print(",");
+    LoRa.print(kalmanAngleY);
+    LoRa.print(",");
+    LoRa.print(so2_value);
+    LoRa.print(",");
+    LoRa.println(no2_value);
+    LoRa.endPacket();
+
+    // Logg data til Serial Monitor
+    Serial.print("Temp: "); Serial.print(filteredTemp); Serial.print(" C, ");
+    Serial.print("Trykk: "); Serial.print(filteredPressure); Serial.print(" hPa, ");
+    Serial.print("Fukt: "); Serial.print(humidity); Serial.print("%, ");
+    Serial.print("GyroX: "); Serial.print(kalmanAngleX); Serial.print(", ");
+    Serial.print("GyroY: "); Serial.print(kalmanAngleY); Serial.print(", ");
+    Serial.print("SO2: "); Serial.print(so2_value); Serial.print("V, ");
+    Serial.print("NO2: "); Serial.println(no2_value);
+
+    delay(500);
+}
